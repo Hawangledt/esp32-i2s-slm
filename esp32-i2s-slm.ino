@@ -1,7 +1,8 @@
 /*
  * Display A-weighted sound level measured by I2S Microphone
  * 
- * (c)2019 Ivan Kostoski
+ * Original Code: (c)2019 Ivan Kostoski
+ * Actual Editor: (c)2023 Rawan H. S. de Campos
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -74,9 +75,9 @@ constexpr double MIC_REF_AMPL = pow(10, double(MIC_SENSITIVITY)/20) * ((1<<(MIC_
 //
 // Below ones are just example for my board layout, put here the pins you will use
 //
-#define I2S_WS            18 
-#define I2S_SCK           23 
-#define I2S_SD            19 
+#define I2S_WS            15 // Blue Wire
+#define I2S_SCK           2  // Yellow Wire
+#define I2S_SD            13 // Orange Wire 
 
 // I2S peripheral to use (0 or 1)
 #define I2S_PORT          I2S_NUM_0
@@ -91,7 +92,7 @@ constexpr double MIC_REF_AMPL = pow(10, double(MIC_SENSITIVITY)/20) * ((1<<(MIC_
   //#define OLED_GEOMETRY GEOMETRY_128_32
   //#define OLED_GEOMETRY GEOMETRY_128_64
   #define OLED_FLIP_V       1
-  SSD1306Wire display(0x3c, SDA, SCL, OLED_GEOMETRY);
+  SSD1306Wire display(0x3c, 5, 4, OLED_GEOMETRY);
 #endif
 
 
@@ -358,7 +359,7 @@ void setup() {
   // i.e. if you want to (slightly) reduce ESP32 power consumption 
   setCpuFrequencyMhz(80); // It should run as low as 80MHz
   
-  Serial.begin(112500);
+  Serial.begin(115200);
   delay(1000); // Safety
   
   #if (USE_DISPLAY > 0)
