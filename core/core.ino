@@ -1,66 +1,25 @@
-/*
- * Display A-weighted sound level measured by I2S Microphone
- * 
- * Original Code: (c)2019 Ivan Kostoski
- * Actual Editor: (c)2023 Rawan H. S. de Campos
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *    
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
- * Sketch samples audio data from I2S microphone, processes the data 
- * with digital IIR filters and calculates A or C weighted Equivalent 
- * Continuous Sound Level (Leq)
- * 
- * I2S is setup to sample data at Fs=48000KHz (fixed value due to 
- * design of digital IIR filters). Data is read from I2S queue 
- * in 'sample blocks' (default 125ms block, equal to 6000 samples) 
- * by 'i2s_reader_task', filtered trough two IIR filters (equalizer 
- * and weighting), summed up and pushed into 'samples_queue' as 
- * sum of squares of filtered samples. The main task then pulls data 
- * from the queue and calculates decibel value relative to microphone 
- * reference amplitude, derived from datasheet sensitivity dBFS 
- * value, number of bits in I2S data, and the reference value for 
- * which the sensitivity is specified (typically 94dB, pure sine
- * wave at 1KHz).
- * 
- * Displays line on the small OLED screen with 'short' LAeq(125ms)
- * response and numeric LAeq(1sec) dB value from the signal RMS.
- */
+#include "sos-iir-filter.h"
+#include "mqtt-connect.h"
 
 #include <driver/i2s.h>
-#include "sos-iir-filter.h"
 
 //
-// Configuration
+// Configuration i2s
 //
 
 #define LEQ_PERIOD        1           // second(s)
 #define WEIGHTING         C_weighting // Also avaliable: 'C_weighting' or 'None' (Z_weighting)
 #define LEQ_UNITS         "LAeq"      // customize based on above weighting used
-#define DB_UNITS          "dBA"       // customize based on above weighting used
-#define USE_DISPLAY       1
+#define DB_UNITS          "dBC"       // customize based on above weighting used
 
-// NOTE: Some microphones require at least DC-Blocker filter
-#define MIC_EQUALIZER     ICS43434    // See below for defined IIR filters or set to 'None' to disable
+#define MIC_EQUALIZER     INMP441     // See below for defined IIR filters or set to 'None' to disable
 #define MIC_OFFSET_DB     3.0103      // Default offset (sine-wave RMS vs. dBFS). Modify this value for linear calibration
 
 // Customize these values from microphone datasheet
 #define MIC_SENSITIVITY   -26         // dBFS value expected at MIC_REF_DB (Sensitivity value from datasheet)
 #define MIC_REF_DB        94.0        // Value at which point sensitivity is specified in datasheet (dB)
 #define MIC_OVERLOAD_DB   116.0       // dB - Acoustic overload point
-#define MIC_NOISE_DB      29          // dB - Noise floor
+#define MIC_NOISE_DB      35          // dB - Noise floor
 #define MIC_BITS          24          // valid number of bits in I2S data
 #define MIC_CONVERT(s)    (s >> (SAMPLE_BITS - MIC_BITS))
 #define MIC_TIMING_SHIFT  0           // Set to one to fix MSB timing for some microphones, i.e. SPH0645LM4H-x
@@ -68,33 +27,12 @@
 // Calculate reference amplitude value at compile time
 constexpr double MIC_REF_AMPL = pow(10, double(MIC_SENSITIVITY)/20) * ((1<<(MIC_BITS-1))-1);
 
-//
-// I2S pins - Can be routed to almost any (unused) ESP32 pin.
-//            SD can be any pin, inlcuding input only pins (36-39).
-//            SCK (i.e. BCLK) and WS (i.e. L/R CLK) must be output capable pins
-//
-// Below ones are just example for my board layout, put here the pins you will use
-//
-#define I2S_WS            15 // Blue Wire
-#define I2S_SCK           2  // Yellow Wire
-#define I2S_SD            13 // Orange Wire 
+#define I2S_WS            25
+#define I2S_SCK           32
+#define I2S_SD            33
 
 // I2S peripheral to use (0 or 1)
-#define I2S_PORT          I2S_NUM_0
-
-//
-// Setup your display library (and geometry) here
-// 
-#if (USE_DISPLAY > 0)
-  // ThingPulse/esp8266-oled-ssd1306, you may need the latest source and PR#198 for 64x48
-  #include <SSD1306Wire.h>
-  #define OLED_GEOMETRY     GEOMETRY_64_48
-  //#define OLED_GEOMETRY GEOMETRY_128_32
-  //#define OLED_GEOMETRY GEOMETRY_128_64
-  #define OLED_FLIP_V       1
-  SSD1306Wire display(0x3c, 5, 4, OLED_GEOMETRY);
-#endif
-
+#define I2S_PORT I2S_NUM_0
 
 //
 // IIR Filters
@@ -120,31 +58,6 @@ SOS_IIR_Filter DC_BLOCKER = {
 // NOTE: SOS matrix 'a1' and 'a2' coefficients are negatives of tf2sos output
 //
 
-// TDK/InvenSense ICS-43434
-// Datasheet: https://www.invensense.com/wp-content/uploads/2016/02/DS-000069-ICS-43434-v1.1.pdf
-// B = [0.477326418836803, -0.486486982406126, -0.336455844522277, 0.234624646917202, 0.111023257388606];
-// A = [1.0, -1.93073383849136326, 0.86519456089576796, 0.06442838283825100, 0.00111249298800616];
-SOS_IIR_Filter ICS43434 = { 
-  gain: 0.477326418836803,
-  sos: { // Second-Order Sections {b1, b2, -a1, -a2}
-   {+0.96986791463971267, 0.23515976355743193, -0.06681948004769928, -0.00111521990688128},
-   {-1.98905931743624453, 0.98908924206960169, +1.99755331853906037, -0.99755481510122113}
-  }
-};
-
-// TDK/InvenSense ICS-43432
-// Datasheet: https://www.invensense.com/wp-content/uploads/2015/02/ICS-43432-data-sheet-v1.3.pdf
-// B = [-0.45733702338341309   1.12228667105574775  -0.77818278904413563, 0.00968926337978037, 0.10345668405223755]
-// A = [1.0, -3.3420781082912949, 4.4033694320978771, -3.0167072679918010, 1.2265536567647031, -0.2962229189311990, 0.0251085747458112]
-SOS_IIR_Filter ICS43432 = {
-  gain: -0.457337023383413,
-  sos: { // Second-Order Sections {b1, b2, -a1, -a2}
-    {-0.544047931916859, -0.248361759321800, +0.403298891662298, -0.207346186351843},
-    {-1.909911869441421, +0.910830292683527, +1.790285722826743, -0.804085812369134},
-    {+0.000000000000000, +0.000000000000000, +1.148493493802252, -0.150599527756651}
-  }
-};
-
 // TDK/InvenSense INMP441
 // Datasheet: https://www.invensense.com/wp-content/uploads/2015/02/INMP441.pdf
 // B ~= [1.00198, -1.99085, 0.98892]
@@ -156,31 +69,6 @@ SOS_IIR_Filter INMP441 = {
   }
 };
 
-// Infineon IM69D130 Shield2Go
-// Datasheet: https://www.infineon.com/dgdl/Infineon-IM69D130-DS-v01_00-EN.pdf?fileId=5546d462602a9dc801607a0e46511a2e
-// B ~= [1.001240684967527, -1.996936108836337, 0.995703101823006]
-// A ~= [1.0, -1.997675693595542, 0.997677044195563]
-// With additional DC blocking component
-SOS_IIR_Filter IM69D130 = {
-  gain: 1.00124068496753,
-  sos: {
-    {-1.0, 0.0, +0.9992, 0}, // DC blocker, a1 = -0.9992
-    {-1.994461610298131, 0.994469278738208, +1.997675693595542, -0.997677044195563}
-  }
-};
-
-// Knowles SPH0645LM4H-B, rev. B
-// https://cdn-shop.adafruit.com/product-files/3421/i2S+Datasheet.PDF
-// B ~= [1.001234, -1.991352, 0.990149]
-// A ~= [1.0, -1.993853, 0.993863]
-// With additional DC blocking component
-SOS_IIR_Filter SPH0645LM4H_B_RB = {
-  gain: 1.00123377961525, 
-  sos: { // Second-Order Sections {b1, b2, -a1, -a2}
-    {-1.0, 0.0, +0.9992, 0}, // DC blocker, a1 = -0.9992
-    {-1.988897663539382, +0.988928479008099, +1.993853376183491, -0.993862821429572}
-  }
-};
 
 //
 // Weighting filters
@@ -360,16 +248,9 @@ void setup() {
   setCpuFrequencyMhz(80); // It should run as low as 80MHz
   
   Serial.begin(115200);
+  connectAWS();
   delay(1000); // Safety
   
-  #if (USE_DISPLAY > 0)
-    display.init();
-    #if (OLED_FLIP_V > 0)
-      display.flipScreenVertically();
-    #endif
-    display.setFont(ArialMT_Plain_16);
-  #endif
-
   // Create FreeRTOS queue
   samples_queue = xQueueCreate(8, sizeof(sum_queue_t));
   
@@ -385,7 +266,7 @@ void setup() {
   double Leq_sum_sqr = 0;
   double Leq_dB = 0;
 
-  // Read sum of samaples, calculated by 'i2s_reader_task'
+  // Read sum of samples, calculated by 'i2s_reader_task'
   while (xQueueReceive(samples_queue, &q, portMAX_DELAY)) {
 
     // Calculate dB values relative to MIC_REF_AMPL and adjust for microphone reference
@@ -412,44 +293,8 @@ void setup() {
       
       // Serial output, customize (or remove) as needed
       Serial.printf("%.1f\n", Leq_dB);
-
-      // Debug only
-      //Serial.printf("%u processing ticks\n", q.proc_ticks);
+      publishMessage(Leq_dB);
     }
-
-    #if (USE_DISPLAY > 0)
-
-      //
-      // Example code that displays the measured value.
-      // You should customize the below code for your display 
-      // and display library used.
-      //
-      
-      display.clear();
-
-      // It is important to somehow notify when the deivce is out of its range
-      // as the calculated values are very likely with big error
-      if (Leq_dB > MIC_OVERLOAD_DB) {
-        // Display 'Overload' if dB value is over the AOP
-        display.drawString(0, 24, "Overload");
-      } else if (isnan(Leq_dB) || (Leq_dB < MIC_NOISE_DB)) {
-        // Display 'Low' if dB value is below noise floor
-        display.drawString(0, 24, "Low");
-      }
-      
-      // The 'short' Leq line
-      double short_Leq_dB = MIC_OFFSET_DB + MIC_REF_DB + 20 * log10(sqrt(double(q.sum_sqr_weighted) / SAMPLES_SHORT) / MIC_REF_AMPL);
-      uint16_t len = min(max(0, int(((short_Leq_dB - MIC_NOISE_DB) / MIC_OVERLOAD_DB) * (display.getWidth()-1))), display.getWidth()-1);
-      display.drawHorizontalLine(0, 0, len);
-      display.drawHorizontalLine(0, 1, len);
-      display.drawHorizontalLine(0, 2, len);
-      
-      // The Leq numeric decibels
-      display.drawString(0, 4, String(Leq_dB, 1) + " " + DB_UNITS);
-      
-      display.display();
-      
-    #endif // USE_DISPLAY
   }
 }
 
